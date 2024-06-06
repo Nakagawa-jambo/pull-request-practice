@@ -1,0 +1,263 @@
+<?php
+App::uses('AppController', 'Controller');
+App::uses('HttpSocket', 'Network/Http');
+App::uses('String', 'Utility');
+App::uses('KyashApi', 'Utility');
+App::uses('Constants', 'Constants');
+
+class KyashPointChangesController extends AppController {
+  public $name = 'KyashPointChanges';
+  public $uses = array('IdentificationPaper', 'KyashChange', 'KyashAccount');
+  const KYASH_EXCHANGE_FEE = 540;
+  const STATUS_PENDING_REVIEW = 0; // 未審査
+
+
+  public function beforeFilter() {
+    parent::beforeFilter();
+    $this->set('title_for_layout', __('ポイント換金'));
+  }
+
+  // Kyash精算画面が開いた時に呼ばれる
+  public function index() {
+    if ($this->isAccountStoredInDb($this->user_id)) {
+      $this->setInitialData();
+    } else {
+      // DBにアカウントがない場合認証画面に遷移
+      $this->redirect(array('action' => 'auth'));
+      return;
+    }
+    // 精算ボタンが押された時の処理
+    if ($this->request->is('post')) {
+      if (!$this->isValidChangeRequest()) { return; }
+      $this->saveKyashChange();
+      $this->redirect(array("controller" =>"point_changes","action"=>"paid"));
+      return;
+    }
+    $this->render('index');
+  }
+
+  public function auth() {
+    // kyash情報をフォームに入力した後の処理
+    if ($this->request->is('post') && $this->checkInputData($this->request)) {
+      // Kyashのアカウントがあれば保存
+      $validation_result = $this->checkValidKyashUser($this->request);
+      if ($validation_result['isValid']) {
+        if ($this->saveKyashAccount($this->request)) {
+          $this->redirect(array('action' => 'index'));
+        } else {
+          $this->Session->setFlash('Kyashアカウントの保存に失敗しました。');
+          $this->render('auth');
+        }
+      } else {
+          $this->Session->setFlash($validation_result['message']);
+          $this->render('auth');
+      }
+    }
+  }
+
+  // 入力内容をチェック
+  private function checkInputData($request) {
+    $input_data = $request->data;
+    $this->KyashChange->set($input_data);
+    if ($this->KyashChange->validates()) {
+      return true;
+    } else {
+      $this->Session->setFlash($this->KyashChange->validationErrors);
+      return false;
+    }
+  }
+
+  // キャッシュアカウント情報をDBに保存
+  private function saveKyashAccount($request) {
+    $input_data = $request->data;
+    $input_data['KyashAccount']['user_id'] = $this->user_id;
+    $input_data['KyashAccount']['application_id'] = $this->application_id;
+    $input_data['KyashAccount']['user_name'] = $this->Common->removeEmoji($this->user_name);
+    $input_data['KyashAccount']['mail_address'] = $this->email;
+    // 既にDBに保存されている場合は更新
+    $existing_account = $this->KyashAccount->find('first', array('conditions' => array('user_id' => $this->user_id)));
+    if (!empty($existing_account)) {
+      $this->KyashAccount->id = $existing_account['KyashAccount']['id'];
+    } else {
+      $this->KyashAccount->create();
+    }
+    return $this->KyashAccount->save($input_data);
+  }
+
+  // DBにKyashのアカウントが保存されているか確認
+  public function isAccountStoredInDb($user_id) {
+    $kyash_account = $this->KyashAccount->find('first', array('conditions' => array('user_id' => $user_id)));
+    if (empty($kyash_account)) {
+      return false;
+    }
+    return true;
+  }
+
+  // Kyashアカウントが存在するか確認
+  public function checkValidKyashUser($request) {
+    $phone_number = $request->data['KyashAccount']['tel_num'];
+    $first_name = $request->data['KyashAccount']['first_name'];
+    $last_name = $request->data['KyashAccount']['last_name'];
+    if (empty($phone_number) || empty($first_name) || empty($last_name)) {
+      return ['isValid' => false, 'message' => '入力されていない項目があります。'];
+    }
+    $phone_number = '81' . substr($phone_number, 1);
+    $kyash_api = new KyashApi();
+    $response = $kyash_api->checkValidKyashUser($phone_number, $first_name, $last_name);
+    if ($response['status'] == 'success') {
+      return ['isValid' => true];
+    } else {
+      return ['isValid' => false, 'message' => $response['message']];
+    }
+  }
+
+  // View側で必要な情報をセットする
+  private function setInitialData() {
+    $this->set('title_for_layout', __('ポイント換金'));
+    $data['exchange']['user_id'] = $this->user_id;
+    $data['exchange']['daily_point'] = $this->fetch_daily_point();
+    // 保有ポイント
+    $data['exchange']['user_point'] = $this->user_point;
+    // 保有ポイントからデイリーボーナスのポイントを引いた額
+    $data['exchange']['earned_point'] = $data['exchange']['user_point'] - $data['exchange']['daily_point'];
+    // 最終的に振り込まれる金額
+    $data['exchange']['transfer_point'] = $data['exchange']['earned_point'] - $this::KYASH_EXCHANGE_FEE;
+    // 獲得ポイントが4000pt以下の場合精算ボタンを非表示にする
+    $this->set('is_enough_point', $this->isEnoughPointToTrade($data));
+
+    // ポイントが足りていない場合、精算に必要なポイントが不足しています。表示
+    if (!$this-> isEnoughPointToTrade($data)){
+      $this->setFlashAndData('精算に必要なポイントが不足しています。', $data, 'error');
+      return;
+    }
+    // 精算可能な場合の表示　　
+    $this->setFlashAndData('精算可能です', $data, 'success');
+  }
+
+  // 入力された金額をバリデーション
+  private function isValidChangeRequest() {
+    $change_amount = $this->request->data['KyashChange']['amount'];
+    // 数値入力をバリデーション。1~99999999ptが入力可能
+    $pattern = '/^[1-9]\d{0,7}$/';
+    if (!is_numeric($change_amount) || !preg_match($pattern, $change_amount)) {
+      $this->Session->setFlash('1pt以上の数値を入力してください', 'flash_error');
+      return false;
+    }
+
+    if ($change_amount > $this->user_point) {
+      $this->Session->setFlash('保有ポイント以上のポイントは入力できません', 'flash_error');
+      return false;
+    }
+
+    // 選択したポイントが精算額に足りていない場合、〇〇pt以上を入力してください表示
+    if (!$this->isEnoughExchangePointToTrade($change_amount)) {
+      if ($this->isFirstTradeAndRecentUser()) {
+        $this->Session->setFlash('2000pt以上を入力してください', 'flash_error');
+      } else {
+        $this->Session->setFlash('5000pt以上を入力してください', 'flash_error');
+      }
+      return false;
+    }
+    return true;
+  }
+
+  // 精算申請を保存
+  private function saveKyashChange() {
+    $exchangePoint = $this->request->data['KyashChange']['amount'];
+    $this->KyashChange->create();
+    $insertData = null;
+    $insertData['KyashChange']['user_id']             = $this->user_id;
+    $insertData['KyashChange']['use_point']           = $exchangePoint;
+    $insertData['KyashChange']['before_point']        = $this->user_point;
+    $insertData['KyashChange']['after_point']         = $this->user_point - $exchangePoint;
+    $insertData['KyashChange']['change_money']        = $exchangePoint - $this::KYASH_EXCHANGE_FEE;
+    $insertData['KyashChange']['exchange_fee']        = $this::KYASH_EXCHANGE_FEE;
+    $insertData['KyashChange']['status']              = self::STATUS_PENDING_REVIEW;
+
+    $this->KyashChange->set($insertData);
+    // バリデーション
+    if(!$this->KyashChange->validates()){
+      $this->Session->setFlash($this->Common->getValidationErrorsToArray($this->KyashChange->validationErrors), 'flash_error');
+      return;
+    }
+
+    // トランザクション開始
+    $this->Transaction->begin(array($this->KyashChange));
+    if(!$this->KyashChange->save($insertData)){
+      $this->Transaction->rollback();
+      throw new InternalErrorException(__('ポイント換金情報の登録処理に失敗しました。0'));
+    }
+
+    $api_data = null;
+    $api_data['trade_point_type'] = Constants::PAYMENT_METHOD_KYASH;
+    $api_data['tradable_point'] = (int)$exchangePoint;
+    $api_data['api'] = 'trade_point_to_money';
+    $api_result = $this->glas_sdk->Reqest($api_data);
+
+    if(empty($api_result)){
+      $this->Transaction->rollback();
+      throw new InternalErrorException(__('ポイント換金情報の登録処理に失敗しました。1'));
+    }
+    $this->Transaction->commit();
+  }
+
+  private function fetch_daily_point() {
+    $get_daily_bonus_api_data                      = null;
+    $get_daily_bonus_api_data['api']               = 'get_daily_bonus';
+    $get_daily_bonus_api_data['get_bonus_user_id'] = $this->user_id;
+    $result = $this->glas_sdk->Reqest( $get_daily_bonus_api_data );
+    $array = get_object_vars( $result );
+    $response_data = get_object_vars( $array['data'] );
+    return $response_data['daily_point'];
+  }
+
+  // メッセージとデータをまとめてview側にセットする関数
+  private function setFlashAndData($message, array $data, $status) {
+    $this->Session->setFlash($message, 'flash_' . $status);
+    $this->set('data', $data );
+  }
+
+  private function isEnoughPointToTrade($data){
+    if ($this->isFirstTradeAndRecentUser()){
+      return $data['exchange']['earned_point'] >= 2000;
+    } else {
+      return $data['exchange']['earned_point'] >= 4000 && $data['exchange']['user_point'] >= 5000;
+    }
+  }
+
+  private function isEnoughExchangePointToTrade($exchangePoint){
+    if ($this->isFirstTradeAndRecentUser()){
+      return $exchangePoint >= 2000;
+    } else {
+      return $exchangePoint >= 5000;
+    }
+  }
+
+  private function isFirstTradeAndRecentUser() {
+    return $this->isFirstTradePointUser() && $this->isRegisterUserWithinMonth();
+  }
+
+  private function  isRegisterUserWithinMonth() {
+    $api_data = null;
+    $api_data['api'] = 'is_register_within_month';
+    $api_result = $this->glas_sdk->Reqest($api_data);
+    return $api_result-> data-> is_register_within_month;
+  }
+
+  private function isFirstTradePointUser() {
+    $mongo = $this->mongoProduction();
+    $log_point_collection = $this->getCollection($mongo,
+      "logdb", "log_point");
+
+    $condition = [];
+    $condition += ["user_id" => $this->user_id];
+    // 精算のアクションタイプ
+    $trade_point_to_money = 38;
+    $condition += ["type" => $trade_point_to_money];
+    if ($log_point_collection->findOne($condition) == null){
+      return true;
+    } else {
+      return false;
+    }
+  }
+}
