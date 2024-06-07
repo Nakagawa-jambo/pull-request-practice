@@ -1,0 +1,61 @@
+import java.time.LocalDateTime
+
+data class User(val id: Int, val name: String, val email: String, val createdAt: LocalDateTime)
+
+class UserService {
+    private val users = mutableListOf<User>()
+
+    fun createUser(name: String, email: String): User {
+        val newUser = User(id = users.size + 1, name = name, email = email, createdAt = LocalDateTime.now())
+        users.add(newUser)
+        return newUser
+    }
+
+    fun getUserById(id: Int): User? {
+        return users.find { it.id == id }
+    }
+
+    fun updateUser(id: Int, name: String, email: String): User? {
+        val userIndex = users.indexOfFirst { it.id == id }
+        return if (userIndex != -1) {
+            val updatedUser = users[userIndex].copy(name = name, email = email)
+            users[userIndex] = updatedUser
+            updatedUser
+        } else {
+            null
+        }
+    }
+
+    fun deleteUser(id: Int): Boolean {
+        return users.removeIf { it.id == id }
+    }
+
+    fun getAllUsers(): List<User> {
+        return users
+    }
+}
+
+fun main() {
+    val userService = UserService()
+
+    val user1 = userService.createUser("Alice", "alice@example.com")
+    println("Created User: $user1")
+
+    val user2 = userService.createUser("Bob", "bob@example.com")
+    println("Created User: $user2")
+
+    val user = userService.getUserById(1)
+    println("Get User By ID 1: $user")
+
+    val updatedUser = userService.updateUser(1, "Alice Smith", "alice.smith@example.com")
+    println("Updated User: $updatedUser")
+
+    val allUsers = userService.getAllUsers()
+    println("All Users: $allUsers")
+
+    val isDeleted = userService.deleteUser(1)
+    println("Deleted User with ID 1: $isDeleted")
+
+    val allUsersAfterDeletion = userService.getAllUsers()
+    println("All Users After Deletion: $allUsersAfterDeletion")
+}
